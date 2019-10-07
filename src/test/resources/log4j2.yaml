@@ -1,0 +1,58 @@
+Configuration:
+  monitorInterval: 5
+  status: warn
+  name: Hacking
+#  properties:
+#    property:
+#      name: filename
+#      value: target/test-yaml.log
+#  thresholdFilter:
+#    level: debug
+  appenders:
+    Console:
+      name: STDOUT
+      PatternLayout:
+        Pattern: "%-5level %date{ABSOLUTE} [%logger] (%thread)%n%msg%n"
+#    File:
+#      name: File
+#      fileName: ${filename}
+#      PatternLayout:
+#        Pattern: "%d %p %C{1.} [%t] %m%n"
+#      Filters:
+#        ThresholdFilter:
+#          level: error
+
+  Loggers:
+    Logger:
+#      -
+#        name: org.apache.logging.slf4j
+#        level: INFO
+      -
+        name: org.eclipse.jetty
+        level: INFO
+      -
+        name: org.eclipse.jetty.client.HttpSender
+        level: DEBUG
+      -
+        name: org.eclipse.jetty.client.HttpReceiver
+        level: DEBUG
+#      -
+#        name: org.apache.logging.log4j.test1
+#        level: debug
+#        additivity: false
+#        ThreadContextMapFilter:
+#          KeyValuePair:
+#            key: test
+#            value: 123
+#        AppenderRef:
+#          ref: STDOUT
+#      -
+#        name: org.apache.logging.log4j.test2
+#        level: debug
+#        additivity: false
+#        AppenderRef:
+#          ref: File
+    Root:
+      level: debug
+      AppenderRef:
+        ref: STDOUT
