@@ -1,30 +1,28 @@
 package com.genesys.apiclient.samples;
 
+import com.genesys.apiclient.GApiClient;
+import com.genesys.apiclient.GRequest;
+import com.genesys.apiclient.OAuthPasswordGrantAuthentication;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.cometd.client.BayeuxClient;
+import org.cometd.client.transport.LongPollingTransport;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.api.ContentResponse;
 import org.eclipse.jetty.client.api.Request;
-import org.eclipse.jetty.client.api.Result;
-import org.eclipse.jetty.client.util.BufferingResponseListener;
-import org.eclipse.jetty.client.util.FormContentProvider;
-import org.eclipse.jetty.client.util.FutureResponseListener;
-import org.eclipse.jetty.client.util.StringContentProvider;
 import org.eclipse.jetty.http.HttpHeader;
-import org.eclipse.jetty.http.MimeTypes;
-import org.eclipse.jetty.util.B64Code;
-import org.eclipse.jetty.util.Fields;
+import org.eclipse.jetty.util.HttpCookieStore;
 import org.eclipse.jetty.util.ajax.JSON;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.junit.jupiter.api.Test;
 
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
+import java.net.CookieStore;
+import java.net.HttpCookie;
+import java.net.URI;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 
 import static com.genesys.apiclient.samples.Environment.*;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 class Samples {
@@ -32,73 +30,152 @@ class Samples {
 
   static final String PROVISIONING_API_PATH = "/provisioning/v3";
 
+  static {
+    // Uncomment to get network traces
+//    System.setProperty("javax.net.debug","all");
+  }
+
+  static class TracingCookieStore extends HttpCookieStore {
+    private final String name;
+
+    public TracingCookieStore(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public void add(URI uri, HttpCookie cookie) {
+      super.add(uri, cookie);
+      log.fatal("Added cookie to " + name + ": " + cookieToString(cookie));
+      log.fatal(cookieStoreToString(name, this));
+    }
+
+    @Override
+    public boolean removeAll() {
+      log.fatal("All cookies removed from " + name);
+      return super.removeAll();
+    }
+  }
+
+
   @Test
   void subscribe_to_Statistics_API() throws Throwable {
 
-    // Uncomment to get network traces
-//    System.setProperty("javax.net.debug","all");
-
-    //GenesysApiContext apiContext = GenesysApiContext.builder()
-    //    .setApiKey(API_KEY)
-    //    .setApiBaseUrl(API_BASE_URL)
-    //    .build(); // Can this also be just a request modifier?
-
-
     SslContextFactory.Client sslContextFactory = new SslContextFactory.Client(); // Needed to accept https
     HttpClient httpClient = new HttpClient(sslContextFactory);
+
+    final HttpCookieStore httpClientCookieStore = new TracingCookieStore("httpClient");
+    httpClient.setCookieStore(httpClientCookieStore);
+
     httpClient.start();
 
-    String tokenUrl = API_BASE_URL + "/auth/v3" + "/oauth/token";
-    Request tokenRequest = httpClient.POST(tokenUrl);
+    GApiClient apiClient = new GApiClient.Builder(httpClient)
+        .setBaseUrl(API_BASE_URL)
+        .setApiKey(API_KEY)
+        .build();
 
-    tokenRequest.header("x-api-key", API_KEY);
-    tokenRequest.header(HttpHeader.AUTHORIZATION, "Basic " + B64Code.encode(CLIENT_ID + ":" + CLIENT_SECRET, StandardCharsets.ISO_8859_1));
+    OAuthPasswordGrantAuthentication auth = apiClient.buildOAuthPasswordGrantAuthentication()
+        .setClientCredentials(CLIENT_ID, CLIENT_SECRET)
+        .setUserCredentials(TENANT, USER_NAME, USER_PASSWORD)
+        .setRenewTokenTimeout(10, SECONDS)
+        .build();
 
-    // alternative:
-//    BasicAuthentication.BasicResult basicAuth = new BasicAuthentication.BasicResult(new URI(tokenUrl), CLIENT_ID, CLIENT_SECRET);
-//    basicAuth.apply(tokenRequest);
+    auth.renewToken(10, SECONDS);
 
-    tokenRequest.accept(MimeTypes.Type.APPLICATION_JSON.toString());
+//    ContentResponse dummyResponse = httpClient.POST(API_BASE_URL + "/statistics/v3/notifications")
+//        .header("x-api-key", API_KEY)
+//        .send();
 
-    Fields fields = new Fields();
-    fields.put("grant_type", "password");
-    fields.put("client_id", CLIENT_ID);
-    fields.put("username", TENANT + "\\" + USER_NAME);
-    fields.put("password", PASSWORD);
-    log.debug("Fields are: " + fields);
-    tokenRequest.content(new FormContentProvider(fields));
+//    HttpCookie statisticsSessionIdCookie = httpClientCookieStore.getCookies().stream()
+//        .filter(cookie -> "STATISTICS_SESSIONID".equalsIgnoreCase(cookie.getName()))
+//        .findFirst()
+//        .get();
 
-    CompletableFuture<Result> tokenResultFuture = new CompletableFuture<>();
+    // Transports are set the cookieProvider *after* creating the bayeuxClient, because
+    // BayeuxClient invariably sets its own cookieProvider inside the constructor.
+    BayeuxClient bayeuxClient;
 
-    // More alternatives for efficiently handling the response in:
-    // https://www.eclipse.org/jetty/documentation/current/http-client-api.html
-    BufferingResponseListener tokenListener = new BufferingResponseListener() {
+    //    if (builder.webSocketEnabled) {
+//      WebSocketTransport webSocketTransport = createWebSocketTransport();
+//      bayeuxClient = new BayeuxClient(builder.client.serverUri + "/api/v2/notifications", webSocketTransport, longPollingTransport);
+//      webSocketTransport.setCookieProvider(builder.cookieSession.getCookieProvider());
+//    } else {
+    SslContextFactory.Client sslContextFactoryComet = new SslContextFactory.Client(); // Needed to accept https
+    HttpClient httpClientComet = new HttpClient(sslContextFactoryComet);
+    httpClientComet.start();
+
+    LongPollingTransport longPollingTransport = new LongPollingTransport(null, httpClientComet) {
       @Override
-      public void onComplete(Result result) {
-        tokenResultFuture.complete(result);
+      protected void customize(Request request) {
+        super.customize(request);
+        apiClient.applyToRequest(request);
+        log.fatal("For request " + request.getURI() + ": " + cookieStoreToString("long-polling", getCookieStore()));
       }
     };
 
-    tokenRequest.send(tokenListener);
+    bayeuxClient = new BayeuxClient(
+        API_BASE_URL + "/statistics/v3/notifications",
+        longPollingTransport);
+//    }
 
-    Result tokenResult = tokenResultFuture.get(10, SECONDS);
-    System.out.println(tokenResult);
+    TracingCookieStore longPollingCookieStore = new TracingCookieStore("long-polling");
+    longPollingTransport.setCookieStore(longPollingCookieStore);
 
-    if (tokenResult.isFailed())
-      throw tokenResult.getFailure();
+    for (HttpCookie c : httpClientCookieStore.getCookies())
+      longPollingCookieStore.add(new URI("https://gapi-use1.genesyscloud.com/statistics/v3/notifications"), c);
 
-    // This is using Jetty Client JSON parser
-    Map tokenResponse = (Map)JSON.parse(new InputStreamReader(tokenListener.getContentAsInputStream(), UTF_8));
-    log.debug("Response: " + tokenResponse);
+//    bayeuxClient.putCookie(statisticsSessionIdCookie);
+//    longPollingCookieStore.add(new URI("https://gapi-use1.genesyscloud.com/statistics/v3/notifications"), statisticsSessionIdCookie);
 
-    // TODO: use refresh_token when access_token expires. This can be done by:
-    // - scheduling refresh before expiration
-    // - refreshing on failed token
-    String accessToken = (String) tokenResponse.get("access_token");
+    bayeuxClient.handshake(5000);
+
+//    subscribe(bayeuxClient, "/**");
+    subscribe(bayeuxClient, "/statistics/v3/service");
+    subscribe(bayeuxClient, "/statistics/v3/updates");
+
+//    HttpCookie statisticsSessionIdCookieFromBayeux = longPollingCookieStore.getCookies().stream()
+//        .filter(cookie -> "STATISTICS_SESSIONID".equalsIgnoreCase(cookie.getName()))
+//        .findFirst()
+//        .get();
+//
+//    httpClientCookieStore.add(
+//        new URI("https://gapi-use1.genesyscloud.com/statistics/v3/notifications"),
+//        statisticsSessionIdCookieFromBayeux);
+
+//    for (HttpCookie c : longPollingCookieStore.getCookies())
+//      httpClientCookieStore.add(new URI("https://gapi-use1.genesyscloud.com/statistics/v3/notifications"), c);
 
     Random random = new Random();
     String id = String.format("%d03", random.nextInt(1000));
 
+    Map<String, Object> subscription = createSubscriptionImmediateAgentState(id);
+
+    GRequest subscribeRequest = apiClient.buildRequest("POST", "/statistics/v3/subscriptions")
+        .setJsonContent(subscription)
+        .build();
+
+    log.fatal("Subscription request content: " + JSON.toString(subscription));
+
+    subscribeRequest.send(10, SECONDS);
+
+    Thread.sleep(30000);
+  }
+
+  private void subscribe(BayeuxClient bayeuxClient, String channelName) throws InterruptedException {
+    CountDownLatch subscribed = new CountDownLatch(1);
+
+    bayeuxClient.getChannel(channelName).subscribe(
+        (channel, message) -> {
+          log.fatal("Received event: Channel {} received message: {}", channel, message);
+        },
+        (channel, message) -> {
+          log.fatal("Received event: Subscribed to channel {} by message: {}", channel, message);
+          subscribed.countDown();
+        });
+
+    subscribed.await(5, SECONDS);
+  }
+
+  private Map<String, Object> createSubscription1(String id) {
     Map<String, Object> stat1Def = new LinkedHashMap<>();
     stat1Def.put("notificationMode", "Periodical");
     stat1Def.put("notificationFrequency", 10);
@@ -121,45 +198,77 @@ class Samples {
     Map<String, Object> subscription = new LinkedHashMap<>();
     subscription.put("operationId", "subscription_" + id);
     subscription.put("data", data);
+    return subscription;
+  }
 
-    Request subscribeRequest = httpClient.POST(API_BASE_URL + "/statistics/v3/subscriptions");
-    subscribeRequest.header("x-api-key", API_KEY);
-    subscribeRequest.header(HttpHeader.AUTHORIZATION, "Bearer " + accessToken);
-    subscribeRequest.header(HttpHeader.CONTENT_TYPE, MimeTypes.Type.APPLICATION_JSON.asString());
-    subscribeRequest.accept(MimeTypes.Type.APPLICATION_JSON.asString());
+  private Map<String, Object> createSubscription2(String id) {
+    Map<String, Object> stat1Def = new LinkedHashMap<>();
+    stat1Def.put("notificationMode", "Periodical");
+    stat1Def.put("notificationFrequency", 5);
+    stat1Def.put("insensitivity", 1);
+    stat1Def.put("category", "CurrentTime");
+    stat1Def.put("subject", "DNStatus");
+    stat1Def.put("mainMask", "*");
 
-    String subscriptionStr = JSON.toString(subscription);
-    log.debug("Subscription message: " + subscriptionStr);
-    subscribeRequest.content(new StringContentProvider(subscriptionStr));
+    Map<String, Object> stat1 = new LinkedHashMap<>();
+    stat1.put("statisticId", "stat_" + id + "_0");
+    stat1.put("objectId", "jim.crespino@genesys.com");
+    stat1.put("objectType", "Agent");
+    stat1.put("definition", stat1Def);
 
-    FutureResponseListener subscribeListener = new FutureResponseListener(subscribeRequest);
-    subscribeRequest.send(subscribeListener);
-    ContentResponse subscribeContentResponse = subscribeListener.get(10, SECONDS);
-    Map subscribeResponse = (Map)JSON.parse(subscribeContentResponse.getContentAsString());
-    log.debug("Subscribe response: " + subscribeResponse);
+    List<Map<String, Object>> statistics = new ArrayList<>();
+    statistics.add(stat1);
 
-    // GenesysAuthContext could be more general than just the current OAuth context.
-    // The context, therefore, is just a transformer of requests! It attaches proper
-    // authn content (like an authn header) to requests.
-//    GenesysAuthContext authContext = GenesysOAuthAuthCodeGrantContext().builder()
-//        .setApiContext(apiContext) // or apiContext.createOAuthAuthCodeGrantContext?
-//        .setClientCredentials(CLIENT_ID, CLIENT_SECRET)
-//        .setUserCredentials(USER_NAME, PASSWORD)
-//        .build(); // This will take time. Needs to be async.
-//
-//    GenesysRequest getQueuesRequest = GenesysRequest.builder()
-//        .setApiContext(apiContext) // isn't this implicit in AuthContext?
-//        .setAuthContext(...) // "Bearer " + token
-//				.setHttpMethod("POST")
-//        .setUrl("/objects/skills")
-//        .build();
+    Map<String, Object> data = new LinkedHashMap<>();
+    data.put("statistics", statistics);
 
-    // GenesysRequest should encapsulate:
-    // - How to send typical request parameters -> can be dependent on specific API
-    // - How to read typical tokenResponse parameters -> can be dependent on specific API
-    // - How to process errors -> can be dependent on specific API
-    // - The JSON tokenResponse type may depend on the JSON library
-//    JsonResponse/*?*/ tokenResponse = getQueuesRequest.execute(); // Should have async counterpart
+    Map<String, Object> subscription = new LinkedHashMap<>();
+    subscription.put("operationId", "subscription_" + id);
+    subscription.put("data", data);
+    return subscription;
+  }
 
+  private Map<String, Object> createSubscriptionImmediateAgentState(String id) {
+    Map<String, Object> statDef = new LinkedHashMap<>();
+    statDef.put("notificationMode", "Immediate");
+    statDef.put("category", "CurrentState");
+    statDef.put("subject", "AgentStatus");
+    statDef.put("mainMask", "*");
+    statDef.put("objects", "Agent"); //???
+
+    Map<String, Object> stat = new LinkedHashMap<>();
+    stat.put("statisticId", "stat_" + id + "_0");
+    stat.put("objectId", "ernesto.garcia@genesys.com");
+    stat.put("objectType", "Agent");
+    stat.put("definition", statDef);
+
+    List<Map<String, Object>> statistics = new ArrayList<>();
+    statistics.add(stat);
+
+    Map<String, Object> data = new LinkedHashMap<>();
+    data.put("statistics", statistics);
+
+    Map<String, Object> subscription = new LinkedHashMap<>();
+    subscription.put("operationId", "subscription_" + id);
+    subscription.put("data", data);
+    return subscription;
+  }
+
+  static String cookieToString(HttpCookie c) {
+    return c + ", domain=" + c.getDomain() + ", path=" + c.getPath();
+  }
+
+  static String cookieStoreToString(String name, CookieStore store) {
+    StringBuilder res = new StringBuilder();
+
+    res.append("Cookie store " + name + ": " + store + "\n");
+
+    for (HttpCookie c : store.getCookies()) {
+      res.append("\t");
+      res.append(cookieToString(c));
+      res.append("\n");
+    }
+
+    return res.toString();
   }
 }
